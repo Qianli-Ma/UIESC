@@ -1,0 +1,30 @@
+data:
+  uieb_input: experiments/datasets/UIEB/raw-890
+  uieb_target: experiments/datasets/UIEB/reference-890
+  uieb_split_dir: experiments/datasets/UIEB
+  image_size: 256
+  batch_size: 16
+  num_workers: 8
+
+model:
+  base_channels: 32
+  lsa_repeats: [1, 1, 2]
+  she_bins: 256
+
+training:
+  epochs: 200
+  lr: 2.0e-4
+  amp: true
+  seed: 42
+  weight_decay: 0.0
+  checkpoint_interval: 10
+
+loss:
+  lambda_l1: 1.0
+  lambda_msssim: 0.01
+  lambda_cl: 0.01
+  contrastive_layers: [1, 3, 5, 9, 13]
+  contrastive_weights: [0.03125, 0.0625, 0.125, 0.25, 1.0]
+
+output:
+  root: experiments/models/baselines/UIESC/outputs
