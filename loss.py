@@ -1,18 +1,90 @@
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchvision.models as models
 
-REPO_ROOT = Path(__file__).resolve().parents[4]
-TRANSFUSE_LOSSES = REPO_ROOT / "experiments" / "models" / "transfuse-gan" / "src" / "losses"
-if str(TRANSFUSE_LOSSES) not in sys.path:
-    sys.path.insert(0, str(TRANSFUSE_LOSSES))
 
-from sharpness_loss import MSSSIMLoss  # noqa: E402
+def _gaussian_window(window_size: int, sigma: float, channels: int) -> torch.Tensor:
+    coords = torch.arange(window_size, dtype=torch.float32) - (window_size - 1) / 2.0
+    g = torch.exp(-(coords**2) / (2.0 * sigma**2))
+    g = g / g.sum()
+    kernel_2d = g[:, None] @ g[None, :]
+    return kernel_2d.expand(channels, 1, window_size, window_size).contiguous()
+
+
+def _ssim_per_scale(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    window: torch.Tensor,
+    window_size: int,
+    c1: float,
+    c2: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    channels = pred.shape[1]
+    pad = window_size // 2
+
+    mu_p = F.conv2d(pred, window, padding=pad, groups=channels)
+    mu_t = F.conv2d(target, window, padding=pad, groups=channels)
+
+    mu_p_sq = mu_p**2
+    mu_t_sq = mu_t**2
+    mu_pt = mu_p * mu_t
+
+    sigma_p_sq = F.conv2d(pred * pred, window, padding=pad, groups=channels) - mu_p_sq
+    sigma_t_sq = F.conv2d(target * target, window, padding=pad, groups=channels) - mu_t_sq
+    sigma_pt = F.conv2d(pred * target, window, padding=pad, groups=channels) - mu_pt
+
+    cs_map = (2.0 * sigma_pt + c2) / (sigma_p_sq + sigma_t_sq + c2)
+    ssim_map = ((2.0 * mu_pt + c1) / (mu_p_sq + mu_t_sq + c1)) * cs_map
+    return ssim_map.mean(), cs_map.mean()
+
+
+class MSSSIMLoss(nn.Module):
+    """Local copy of the TransFuse-GAN MS-SSIM loss."""
+
+    def __init__(
+        self,
+        window_size: int = 11,
+        sigma: float = 1.5,
+        channels: int = 3,
+        data_range: float = 1.0,
+    ) -> None:
+        super().__init__()
+        self.window_size = window_size
+        self.register_buffer(
+            "weights",
+            torch.tensor([0.0448, 0.2856, 0.3001, 0.2363, 0.1333], dtype=torch.float32),
+        )
+        self.c1 = (0.01 * data_range) ** 2
+        self.c2 = (0.03 * data_range) ** 2
+        self.register_buffer("window", _gaussian_window(window_size, sigma, channels))
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        # MS-SSIM uses squared terms and gaussian convolutions that overflow in
+        # fp16. Force fp32 regardless of the surrounding autocast context.
+        with torch.amp.autocast(device_type="cuda", enabled=False):
+            pred = pred.float()
+            target = target.float()
+            window = self.window.float()
+            weights = self.weights.float()
+
+            cs_values: list[torch.Tensor] = []
+            ssim_value = pred.new_tensor(0.0)
+            for scale in range(weights.numel()):
+                ssim_value, cs_value = _ssim_per_scale(
+                    pred, target, window, self.window_size, self.c1, self.c2
+                )
+                cs_values.append(cs_value.clamp(min=0.0))
+                if scale < weights.numel() - 1:
+                    pred = F.avg_pool2d(pred, kernel_size=2)
+                    target = F.avg_pool2d(target, kernel_size=2)
+
+            ssim_value = ssim_value.clamp(min=0.0)
+            cs_stack = torch.stack(cs_values)
+            ms_ssim = torch.prod(cs_stack**weights) * (ssim_value ** weights[-1])
+            return 1.0 - ms_ssim
 
 
 class VGG19FeatureExtractor(nn.Module):
@@ -56,9 +128,11 @@ class ContrastiveLoss(nn.Module):
         self.register_buffer("weights", torch.tensor(weights, dtype=torch.float32))
 
     def forward(self, source: torch.Tensor, enhanced: torch.Tensor, clear: torch.Tensor) -> torch.Tensor:
-        clear_features = self.extractor(clear)
-        enhanced_features = self.extractor(enhanced)
-        source_features = self.extractor(source)
+        # VGG-19 feature norms can overflow in fp16. Run extraction in fp32.
+        with torch.amp.autocast(device_type="cuda", enabled=False):
+            clear_features = self.extractor(clear.float())
+            enhanced_features = self.extractor(enhanced.float())
+            source_features = self.extractor(source.float())
 
         loss = enhanced.new_tensor(0.0)
         for weight, positive, anchor, negative in zip(

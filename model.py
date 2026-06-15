@@ -50,7 +50,7 @@ class CrissCrossSpatialAttention(nn.Module):
         col_attn = torch.softmax(torch.bmm(q_col, k_col), dim=-1)
         col_out = torch.bmm(col_attn, v_col).reshape(b, w, h, c).permute(0, 3, 2, 1)
 
-        return x + self.gamma * 0.5 * (row_out + col_out)
+        return self.gamma * 0.5 * (row_out + col_out)
 
 
 class ChannelAttention(nn.Module):
@@ -59,31 +59,31 @@ class ChannelAttention(nn.Module):
         self.beta = nn.Parameter(torch.zeros(1))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        b, c, h, w = x.shape
-        flat = x.reshape(b, c, h * w)
-        energy = torch.bmm(flat, flat.transpose(1, 2))
-        attention = torch.softmax(energy, dim=-1)
-        out = torch.bmm(attention, flat).reshape(b, c, h, w)
-        return x + self.beta * out
+        # C×HW matrix product produces large values that overflow in fp16.
+        with torch.amp.autocast(device_type="cuda", enabled=False):
+            b, c, h, w = x.shape
+            flat = x.float().reshape(b, c, h * w)
+            energy = torch.bmm(flat, flat.transpose(1, 2))
+            attention = torch.softmax(energy, dim=-1)
+            out = torch.bmm(attention, flat).reshape(b, c, h, w).to(x.dtype)
+        return self.beta * out
 
 
 class LSAModule(nn.Module):
-    """Lightweight self-attention module with parallel spatial/channel branches."""
+    """Lightweight self-attention module with parallel spatial/channel branches.
+
+    Each branch returns only its attention delta. The residual (input) is added
+    once here, matching the paper (§III-A, Fig. 3): output = x + spatial_delta
+    + channel_delta.
+    """
 
     def __init__(self, channels: int) -> None:
         super().__init__()
         self.spatial = CrissCrossSpatialAttention(channels)
         self.channel = ChannelAttention()
-        self.aggregate = nn.Sequential(
-            nn.Conv2d(channels * 2, channels, 1, bias=False),
-            nn.BatchNorm2d(channels),
-            nn.ReLU(inplace=True),
-        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        spatial = self.spatial(x)
-        channel = self.channel(x)
-        return x + self.aggregate(torch.cat([spatial, channel], dim=1))
+        return x + self.spatial(x) + self.channel(x)
 
 
 class AdaptiveFeatureFusion(nn.Module):
@@ -162,7 +162,7 @@ class SmoothedHistogramEqualization(nn.Module):
                     out[b, c] = channel
                     continue
                 idx = torch.clamp((channel * (self.bins - 1)).round().long(), 0, self.bins - 1)
-                hist = torch.bincount(idx.flatten(), minlength=self.bins).to(dtype=x.dtype, device=x.device)
+                hist = torch.bincount(idx.flatten().cpu(), minlength=self.bins).to(dtype=x.dtype, device=x.device)
                 smoothed = torch.log1p(hist)
                 total = smoothed.sum()
                 if total <= 0:

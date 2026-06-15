@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import random
-import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -15,7 +14,6 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 if __package__ is None or __package__ == "":
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
     from dataset import build_uieb_loader, resolve_repo_path
     from loss import UIESCLoss
     from model import UIESCModel
@@ -63,7 +61,7 @@ def make_loss(cfg: dict[str, Any]) -> UIESCLoss:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train the UIESC baseline on UIEB.")
-    parser.add_argument("--config", default="baselines/UIESC/config.yaml")
+    parser.add_argument("--config", default="experiments/models/baselines/UIESC/config.yaml")
     parser.add_argument("--resume", type=Path, default=None)
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
@@ -74,7 +72,11 @@ def parse_args() -> argparse.Namespace:
 
 
 @torch.no_grad()
-def validate_psnr(model: torch.nn.Module, loader: torch.utils.data.DataLoader, device: torch.device) -> dict[str, float]:
+def validate(
+    model: torch.nn.Module,
+    loader: torch.utils.data.DataLoader,
+    device: torch.device,
+) -> dict[str, float]:
     model.eval()
     psnr_scores: list[float] = []
     l1_scores: list[float] = []
@@ -136,7 +138,35 @@ def print_inference_stats(
     print("Batch size        : 1")
 
 
-def main() -> None:
+def _print_run_summary(
+    cfg: dict[str, Any],
+    epochs: int,
+    completed_epochs: int,
+    epoch_times: list[float],
+    peak_train_vram_gb: float,
+    best_val_psnr: float,
+    best_epoch: int,
+    use_amp: bool,
+    device: torch.device,
+    params_m: float,
+) -> None:
+    avg_epoch_time = sum(epoch_times) / max(len(epoch_times), 1)
+    training_cfg = cfg.get("training", {})
+    data_cfg = cfg.get("data", {})
+
+    print("\n--- Run Summary ---")
+    print(f"Device            : {device} | AMP: {use_amp}")
+    print(f"Parameter count   : {params_m:.3f} M")
+    print(f"Epochs planned    : {epochs}")
+    print(f"Epochs completed  : {completed_epochs}")
+    print(f"Batch size        : {data_cfg.get('batch_size', '?')}")
+    print(f"Learning rate     : {training_cfg.get('lr', '?')}")
+    print(f"Avg epoch time    : {avg_epoch_time:.2f}s")
+    print(f"Peak train VRAM   : {peak_train_vram_gb:.3f} GB")
+    print(f"Best val PSNR     : {best_val_psnr:.4f} dB  (epoch {best_epoch + 1})")
+
+
+def main() -> bool:
     args = parse_args()
     config_path = resolve_repo_path(args.config)
     cfg = load_config(config_path)
@@ -162,15 +192,18 @@ def main() -> None:
     tb_dir.mkdir(parents=True, exist_ok=True)
 
     model = make_model(cfg).to(device)
+    params_m = sum(p.numel() for p in model.parameters()) / 1_000_000
 
     start_epoch = 0
     best_val_psnr = float("-inf")
+    best_epoch = 0
+
     if args.inference_stats:
         if args.resume is not None:
             state = torch.load(args.resume, map_location=device)
             model.load_state_dict(state["model"])
         print_inference_stats(model, cfg, device, use_amp)
-        return
+        return False
 
     criterion = make_loss(cfg).to(device)
     optimizer = torch.optim.Adam(
@@ -186,6 +219,7 @@ def main() -> None:
         optimizer.load_state_dict(state["optimizer"])
         start_epoch = int(state["epoch"]) + 1
         best_val_psnr = float(state.get("best_val_psnr", best_val_psnr))
+        best_epoch = int(state.get("best_epoch", 0))
 
     train_loader = build_uieb_loader(cfg, split="train", shuffle=True, drop_last=True, pin_memory=use_amp)
     val_loader = build_uieb_loader(cfg, split="val", shuffle=False, drop_last=False, pin_memory=use_amp)
@@ -195,14 +229,23 @@ def main() -> None:
     checkpoint_interval = int(training_cfg.get("checkpoint_interval", 10))
     global_step = start_epoch * len(train_loader)
 
-    print(f"Config: {config_path}")
-    print(f"Device: {device} | AMP: {use_amp}")
-    print(f"Output: {output_root}")
-    print(f"Train batches: {len(train_loader)} | Val batches: {len(val_loader)}")
+    # Accumulators for run summary
+    epoch_times: list[float] = []
+    peak_train_vram_gb: float = 0.0
+
+    print(f"Config            : {config_path}")
+    print(f"Device            : {device} | AMP: {use_amp}")
+    print(f"Parameter count   : {params_m:.3f} M")
+    print(f"Output            : {output_root}")
+    print(f"Train batches     : {len(train_loader)} | Val batches: {len(val_loader)}")
 
     for epoch in range(start_epoch, epochs):
         model.train()
-        epoch_start = time.time()
+        epoch_start = time.perf_counter()
+
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats()
+
         progress = tqdm(train_loader, desc=f"epoch {epoch + 1}/{epochs}")
         running = {"total": 0.0, "l1": 0.0, "msssim": 0.0, "cl": 0.0}
         seen_batches = 0
@@ -211,23 +254,16 @@ def main() -> None:
             inputs = batch["input"].to(device, non_blocking=True)
             targets = batch["target"].to(device, non_blocking=True)
 
-            if device.type == "cuda" and not hasattr(model, "_vram_recorded"):
-                torch.cuda.reset_peak_memory_stats()
-
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type="cuda", enabled=use_amp):
                 enhanced_lsan = model.forward_lsan(inputs)
                 loss, loss_parts = criterion(inputs, enhanced_lsan, targets)
 
             scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
-
-            if device.type == "cuda" and not hasattr(model, "_vram_recorded"):
-                peak = torch.cuda.max_memory_allocated() / 1024**3
-                batch_size = int(cfg.get("data", {}).get("batch_size", 16))
-                print(f"Peak training VRAM: {peak:.3f} GB  (AMP {'on' if use_amp else 'off'}, batch {batch_size})")
-                model._vram_recorded = True
 
             running["total"] += loss.item()
             running["l1"] += loss_parts["l1"].item()
@@ -237,38 +273,90 @@ def main() -> None:
             global_step += 1
             progress.set_postfix(loss=f"{loss.item():.4f}", l1=f"{loss_parts['l1'].item():.4f}")
 
-        metrics = validate_psnr(model, val_loader, device)
-        val_psnr = float(metrics["PSNR"])
+        # --- Epoch timing and VRAM ---
+        epoch_elapsed = time.perf_counter() - epoch_start
+        epoch_times.append(epoch_elapsed)
+
+        if device.type == "cuda":
+            epoch_vram = torch.cuda.max_memory_allocated() / 1024**3
+            peak_train_vram_gb = max(peak_train_vram_gb, epoch_vram)
+        else:
+            epoch_vram = 0.0
+
+        # --- Validation ---
+        val_metrics = validate(model, val_loader, device)
+        val_psnr = float(val_metrics["PSNR"])
+        val_l1 = float(val_metrics["L1"])
+
+        # --- Averaged train losses ---
         train_total = running["total"] / max(seen_batches, 1)
         train_l1 = running["l1"] / max(seen_batches, 1)
         train_msssim = running["msssim"] / max(seen_batches, 1)
         train_cl = running["cl"] / max(seen_batches, 1)
+
+        # --- TensorBoard ---
         writer.add_scalar("Loss/train_total", train_total, epoch)
         writer.add_scalar("Loss/train_l1", train_l1, epoch)
         writer.add_scalar("Loss/train_msssim", train_msssim, epoch)
         writer.add_scalar("Loss/train_cl", train_cl, epoch)
         writer.add_scalar("Metrics/val_psnr", val_psnr, epoch)
+        writer.add_scalar("Metrics/val_l1", val_l1, epoch)
+        writer.add_scalar("Perf/epoch_time_s", epoch_elapsed, epoch)
+        writer.add_scalar("Perf/peak_train_vram_gb", epoch_vram, epoch)
 
+        # --- Checkpoints ---
         state = {
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "epoch": epoch,
             "best_val_psnr": max(best_val_psnr, val_psnr),
+            "best_epoch": best_epoch,
             "config": cfg,
         }
+
+        # latest.pth — always overwritten, enables --resume without knowing epoch
+        torch.save(state, checkpoint_dir / "latest.pth")
+
         if checkpoint_interval > 0 and (epoch + 1) % checkpoint_interval == 0:
             torch.save(state, checkpoint_dir / f"epoch_{epoch + 1:04d}.pth")
+
         if val_psnr > best_val_psnr:
             best_val_psnr = val_psnr
+            best_epoch = epoch
             state["best_val_psnr"] = best_val_psnr
+            state["best_epoch"] = best_epoch
             torch.save(state, checkpoint_dir / "best_generator.pth")
 
-        elapsed = time.time() - epoch_start
-        print(f"[Epoch {epoch + 1}/{epochs}] loss={train_total:.4f} | val_psnr={val_psnr:.4f} | best={best_val_psnr:.4f}")
-        print(f"elapsed={elapsed:.1f}s")
+        print(
+            f"[Epoch {epoch + 1}/{epochs}] "
+            f"loss={train_total:.4f} | "
+            f"val_psnr={val_psnr:.4f} | "
+            f"best={best_val_psnr:.4f} (ep {best_epoch + 1}) | "
+            f"vram={epoch_vram:.2f}GB | "
+            f"time={epoch_elapsed:.1f}s"
+        )
 
     writer.close()
 
+    _print_run_summary(
+        cfg=cfg,
+        epochs=epochs,
+        completed_epochs=len(epoch_times),
+        epoch_times=epoch_times,
+        peak_train_vram_gb=peak_train_vram_gb,
+        best_val_psnr=best_val_psnr,
+        best_epoch=best_epoch,
+        use_amp=use_amp,
+        device=device,
+        params_m=params_m,
+    )
+    return True
+
 
 if __name__ == "__main__":
-    main()
+    _start = time.perf_counter()
+    _did_train = main()
+    _elapsed = time.perf_counter() - _start
+    if _did_train:
+        _minutes, _seconds = divmod(_elapsed, 60)
+        print(f"\nTotal training time: {int(_minutes)}m {_seconds:.1f}s")

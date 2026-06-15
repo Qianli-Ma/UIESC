@@ -82,10 +82,10 @@ with `pytorch-cuda=12.1`.
 
 ---
 
-## Dependencies
+## Local Copies
 
-`datasets/` and `evaluation/` are copied from the thesis codebase and shared across
-all baseline implementations to ensure consistent data splits and metric computation.
+The UIEB loader and MS-SSIM loss are vendored into `dataset.py` and `loss.py`.
+This baseline does not import helper modules from TransFuse-GAN at runtime.
 
 Expected layout:
 
@@ -93,20 +93,11 @@ Expected layout:
 UIESC/
     model.py
     train.py
+    dataset.py
+    loss.py
     config.yaml
-    datasets/
-        loaders.py
-        splits/
-            uieb/
-                train.txt
-                val.txt
-                test.txt
-    evaluation/
-        benchmark.py
     outputs/
         checkpoints/
-        samples/
-        logs/
 ```
 
 ---
@@ -115,29 +106,30 @@ UIESC/
 
 **UIEB** (Li et al., 2020): 890 paired underwater images. Download from the
 [project page](https://li-chongyi.github.io/proj_benchmark.html) and set
-`uieb_input` and `uieb_target` in `config.yaml`. Split files are read from
-`datasets/splits/uieb/`.
+`uieb_input` and `uieb_target` in `config.yaml`. The default paths point to
+`experiments/datasets/UIEB/raw-890`, `reference-890`, and the split files in
+`experiments/datasets/UIEB`.
 
 ---
 
 ## Training
 
 ```bash
-mamba run -n uiesc python train.py --config config.yaml
+mamba run -n uiesc python experiments/models/baselines/UIESC/train.py \
+    --config experiments/models/baselines/UIESC/config.yaml
 ```
 
 The best validation-PSNR checkpoint is saved to:
 
 ```
-outputs/checkpoints/best_generator.pth
+experiments/models/baselines/UIESC/outputs/checkpoints/best_generator.pth
 ```
 
 Validation runs `model(inputs)` so SHE is active during checkpoint selection.
 Training losses are applied to `model.forward_lsan(inputs)` before SHE, matching
 the paper's two-stage design.
 
-To resume from a checkpoint, set `resume_checkpoint` in `config.yaml` or pass
-`--resume outputs/checkpoints/latest.pth`.
+To resume from a checkpoint, pass `--resume`.
 
 ---
 
@@ -145,7 +137,7 @@ To resume from a checkpoint, set `resume_checkpoint` in `config.yaml` or pass
 
 ```bash
 mamba run -n uiesc python eval.py \
-    --checkpoint outputs/checkpoints/best_generator.pth \
+    --checkpoint experiments/models/baselines/UIESC/outputs/checkpoints/best_generator.pth \
     --split test \
     --device cuda
 ```
@@ -157,7 +149,8 @@ Prints PSNR, SSIM, UCIQE, UIQM, parameter count, ms/image, and peak VRAM.
 ## Inference Stats
 
 ```bash
-mamba run -n uiesc python train.py --config config.yaml --inference-stats
+mamba run -n uiesc python experiments/models/baselines/UIESC/train.py \
+    --config experiments/models/baselines/UIESC/config.yaml --inference-stats
 ```
 
 Prints AMP status, parameter count, total test images, wall-clock time per image at
